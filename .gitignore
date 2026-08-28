@@ -4,3 +4,11 @@
 .idea/
 .vscode/
 .DS_Store
+
+# makepkg build artifacts (packaging/)
+/packaging/pkg/
+/packaging/src/
+/packaging/ventlinux/
+/packaging/*.pkg.tar.*
+/packaging/*.src.tar.*
+/packaging/*.log

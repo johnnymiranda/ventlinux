@@ -14,7 +14,7 @@
 
 _pkgname=ventlinux
 pkgname=ventlinux-git
-pkgver=r5.fc0d2e8
+pkgver=r6.c7e563c
 pkgrel=1
 pkgdesc="Native Linux client for Ventrilo 3 voice servers, with global push-to-talk"
 arch=('x86_64')
@@ -22,6 +22,13 @@ url="https://github.com/johnnymiranda/ventlinux"
 license=('GPL-3.0-or-later')
 depends=('gtk4' 'libadwaita' 'speex' 'speexdsp' 'opus' 'alsa-lib')
 makedepends=('git' 'rust' 'clang' 'pkgconf')
+# Arch enables LTO in makepkg.conf OPTIONS, which puts -flto=auto in the
+# exported CFLAGS. The cc crate honours those when it builds the vendored
+# libventrilo3 sources, so the archive ends up holding GCC LTO bitcode that
+# rustc's linker cannot read -- every v3_* symbol comes back undefined. The
+# release profile in Cargo.toml still does Rust-side LTO; this only opts out
+# of makepkg's C-side LTO.
+options=(!lto)
 provides=("$_pkgname=$pkgver")
 conflicts=("$_pkgname")
 source=("$_pkgname::git+$url.git")
