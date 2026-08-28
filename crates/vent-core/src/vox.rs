@@ -81,8 +81,15 @@ impl VoxGate {
         self.muted
     }
     pub fn set_muted(&mut self, muted: bool) {
-        if muted && self.is_open {
-            self.pending_close_from_mute = true;
+        if muted {
+            if self.is_open {
+                self.pending_close_from_mute = true;
+            }
+        } else {
+            // Unmuting before the gate processed the mute cancels the pending
+            // close; leaving it set would emit a Close with no matching Open
+            // the next time the user mutes.
+            self.pending_close_from_mute = false;
         }
         self.muted = muted;
     }
@@ -247,6 +254,35 @@ mod tests {
         }
         assert!(closed);
         assert!(!g.is_open());
+    }
+
+    #[test]
+    fn unmute_before_processing_cancels_the_pending_close() {
+        let mut g = VoxGate::default();
+        let _ = g.process(&pcm(-15.0, 40.0, 48_000), 48_000);
+        assert!(g.is_open());
+
+        // Mute and unmute between two chunks: the gate never saw the mute.
+        g.set_muted(true);
+        g.set_muted(false);
+
+        // Let it close on its own, then mute while it is already closed.
+        for _ in 0..20 {
+            if matches!(
+                g.process(&pcm(-90.0, 40.0, 48_000), 48_000),
+                VoxAction::Close
+            ) {
+                break;
+            }
+        }
+        assert!(!g.is_open());
+        g.set_muted(true);
+
+        assert_eq!(
+            g.process(&pcm(-90.0, 40.0, 48_000), 48_000),
+            VoxAction::Idle,
+            "a closed gate must not emit a second Close"
+        );
     }
 
     #[test]
