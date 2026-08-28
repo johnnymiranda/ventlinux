@@ -34,6 +34,10 @@ pub struct AppConfig {
     pub input_device: String,
     #[serde(default)]
     pub output_device: String,
+    /// False in configs written before the F13 default was dropped; those get
+    /// migrated once on load.
+    #[serde(default)]
+    pub ptt_migrated: bool,
 }
 
 fn default_mode() -> String {
@@ -51,6 +55,8 @@ impl Default for AppConfig {
             vox_sensitivity: default_vox(),
             input_device: String::new(),
             output_device: String::new(),
+            // A fresh config already uses the current default binding.
+            ptt_migrated: true,
         }
     }
 }

@@ -24,6 +24,15 @@ impl Roster {
                 self.channels.remove(id);
             }
             CoreEvent::UserUpserted(user) => {
+                // A user who leaves the channel mid-transmission never sends a
+                // talk-end, so drop the talking flag on any channel change.
+                if self
+                    .users
+                    .get(&user.id)
+                    .is_some_and(|old| old.channel_id != user.channel_id)
+                {
+                    self.talking.remove(&user.id);
+                }
                 self.users.insert(user.id, user.clone());
             }
             CoreEvent::UserRemoved(id) => {
@@ -143,6 +152,56 @@ mod tests {
             codec: 0,
             codec_format: 0,
         }
+    }
+
+    fn user(id: u16, channel_id: u16, name: &str) -> User {
+        User {
+            id,
+            channel_id,
+            name: name.into(),
+            phonetic: String::new(),
+            comment: String::new(),
+            url: String::new(),
+            rank_id: 0,
+            guest: false,
+            global_mute: false,
+            channel_mute: false,
+            phantom: false,
+            accepts_pages: true,
+            accepts_private_chat: true,
+        }
+    }
+
+    #[test]
+    fn changing_channel_stops_showing_a_user_as_talking() {
+        let mut roster = Roster::default();
+        roster.apply(&CoreEvent::UserUpserted(user(5, 1, "Ann")));
+        roster.apply(&CoreEvent::TalkStarted {
+            user_id: 5,
+            rate: 48_000,
+        });
+        assert!(roster.talking.contains(&5));
+
+        // Leaving the channel mid-transmission produces no talk-end.
+        roster.apply(&CoreEvent::UserUpserted(user(5, 2, "Ann")));
+
+        assert!(!roster.talking.contains(&5));
+    }
+
+    #[test]
+    fn a_plain_user_update_keeps_the_talking_flag() {
+        let mut roster = Roster::default();
+        roster.apply(&CoreEvent::UserUpserted(user(5, 1, "Ann")));
+        roster.apply(&CoreEvent::TalkStarted {
+            user_id: 5,
+            rate: 48_000,
+        });
+
+        let mut renamed = user(5, 1, "Ann");
+        renamed.comment = "brb".into();
+        roster.apply(&CoreEvent::UserUpserted(renamed));
+
+        assert!(roster.talking.contains(&5));
     }
 
     #[test]
