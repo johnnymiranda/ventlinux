@@ -19,7 +19,44 @@ pub struct AudioDevice {
     pub is_output: bool,
 }
 
+/// Silence libasound's own stderr output.
+///
+/// Enumerating devices walks every ALSA PCM, and on a PipeWire system a fair
+/// number of them cannot be opened -- the legacy OSS shim wants `/dev/dsp`, the
+/// surround route plugins find no matching channel map. libasound reports those
+/// from C straight to stderr, so they never pass through `tracing` and no
+/// Rust-side filter can reach them; ALSA's global error handler is the only
+/// lever. Failures that actually matter still come back through cpal's
+/// `Result`s, which callers surface as before.
+fn silence_alsa_errors() {
+    use std::os::raw::{c_char, c_int};
+    use std::sync::Once;
+
+    unsafe extern "C" fn discard(
+        _file: *const c_char,
+        _line: c_int,
+        _function: *const c_char,
+        _err: c_int,
+        _fmt: *const c_char,
+    ) {
+    }
+
+    // libasound's handler type is variadic, and *defining* a variadic
+    // `extern "C"` fn still needs the unstable c_variadic feature. Transmuting
+    // the fixed-arg prefix is sound here: `discard` never reads the varargs,
+    // and the C ABI lets a callee ignore them.
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        let handler = std::mem::transmute::<
+            unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char),
+            unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char, ...),
+        >(discard);
+        alsa_sys::snd_lib_error_set_handler(Some(handler));
+    });
+}
+
 pub fn list_devices() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
+    silence_alsa_errors();
     let host = cpal::default_host();
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
@@ -100,6 +137,7 @@ fn forget_device(want_input: bool, name: Option<&str>) -> bool {
 }
 
 fn find_device(want_input: bool, name: Option<&str>) -> Result<Device> {
+    silence_alsa_errors();
     let host = cpal::default_host();
     if let Some(name) = name.filter(|s| !s.is_empty()) {
         let iter = if want_input {

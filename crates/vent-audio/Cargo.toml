@@ -9,3 +9,6 @@ description = "PipeWire/cpal capture and mixed playback for VentLinux"
 cpal = { workspace = true }
 anyhow = { workspace = true }
 vent-core = { path = "../vent-core" }
+# Only for snd_lib_error_set_handler, to stop libasound writing enumeration
+# failures to stderr. Already in the tree via cpal -> alsa -> alsa-sys.
+alsa-sys = "0.3"
