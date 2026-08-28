@@ -1,0 +1,11 @@
+[package]
+name = "vent-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PipeWire/cpal capture and mixed playback for VentLinux"
+
+[dependencies]
+cpal = { workspace = true }
+anyhow = { workspace = true }
+vent-core = { path = "../vent-core" }

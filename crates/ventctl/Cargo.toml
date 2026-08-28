@@ -1,0 +1,17 @@
+[package]
+name = "ventctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless Ventrilo 3 smoke-test client"
+
+[[bin]]
+name = "ventctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+ctrlc = { workspace = true }
+vent-core = { path = "../vent-core" }
+vent-audio = { path = "../vent-audio" }

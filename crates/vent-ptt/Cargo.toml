@@ -1,0 +1,10 @@
+[package]
+name = "vent-ptt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Global push-to-talk via evdev (works over fullscreen games)"
+
+[dependencies]
+evdev = { workspace = true }
+serde = { workspace = true }

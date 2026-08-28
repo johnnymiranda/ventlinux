@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vent-sys",
+    "crates/vent-core",
+    "crates/vent-audio",
+    "crates/vent-ptt",
+    "crates/ventctl",
+    "crates/ventlinux",
+]
+default-members = ["crates/ventctl", "crates/ventlinux"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/johnnymiranda/ventlinux"
+authors = ["Johnny Miranda"]
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.15"
+evdev = "0.13"
+directories = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ctrlc = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
