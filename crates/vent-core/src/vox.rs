@@ -201,7 +201,10 @@ mod tests {
     #[test]
     fn stays_closed_below_threshold() {
         let mut g = VoxGate::default();
-        assert_eq!(g.process(&pcm(-60.0, 40.0, 48_000), 48_000), VoxAction::Idle);
+        assert_eq!(
+            g.process(&pcm(-60.0, 40.0, 48_000), 48_000),
+            VoxAction::Idle
+        );
         assert!(!g.is_open());
     }
 
@@ -234,7 +237,10 @@ mod tests {
         let _ = g.process(&pcm(-15.0, 40.0, 48_000), 48_000);
         let mut closed = false;
         for _ in 0..20 {
-            if matches!(g.process(&pcm(-90.0, 40.0, 48_000), 48_000), VoxAction::Close) {
+            if matches!(
+                g.process(&pcm(-90.0, 40.0, 48_000), 48_000),
+                VoxAction::Close
+            ) {
                 closed = true;
                 break;
             }

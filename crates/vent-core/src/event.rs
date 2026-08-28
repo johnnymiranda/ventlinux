@@ -41,24 +41,35 @@ pub struct Codec {
 impl Codec {
     /// Speex (3) and Opus (1, 2) — matches the HAVE_* flags we compile with.
     pub fn is_supported(&self) -> bool {
-        matches!(self.codec_id, 1 | 2 | 3)
+        matches!(self.codec_id, 1..=3)
     }
 }
 
 #[derive(Clone, Debug)]
 pub enum CoreEvent {
-    Status { percent: u8, message: String },
+    Status {
+        percent: u8,
+        message: String,
+    },
     LoginCompleted,
     LoginFailed(String),
-    ErrorMessage { message: String, disconnected: bool },
+    ErrorMessage {
+        message: String,
+        disconnected: bool,
+    },
     ChannelUpserted(Channel),
     ChannelRemoved(u16),
     ChannelPasswordRejected(u16),
     UserUpserted(User),
     UserRemoved(u16),
     MovedToChannel(u16),
-    TalkStarted { user_id: u16, rate: u32 },
-    TalkEnded { user_id: u16 },
+    TalkStarted {
+        user_id: u16,
+        rate: u32,
+    },
+    TalkEnded {
+        user_id: u16,
+    },
     Audio {
         user_id: u16,
         rate: u32,
@@ -67,20 +78,40 @@ pub enum CoreEvent {
     },
     Motd(String),
     Ping(u16),
-    ChatJoined { user_id: u16 },
-    ChatLeft { user_id: u16 },
-    ChatMessage { user_id: u16, message: String },
-    PrivateChatStarted { peer: u16 },
-    PrivateChatEnded { peer: u16 },
+    ChatJoined {
+        user_id: u16,
+    },
+    ChatLeft {
+        user_id: u16,
+    },
+    ChatMessage {
+        user_id: u16,
+        message: String,
+    },
+    PrivateChatStarted {
+        peer: u16,
+    },
+    PrivateChatEnded {
+        peer: u16,
+    },
     PrivateChatMessage {
         peer: u16,
         from_self: bool,
         message: String,
     },
-    PrivateChatAway { peer: u16 },
-    PrivateChatBack { peer: u16 },
-    Paged { from_user: u16 },
-    TtsMessage { user_id: u16, message: String },
+    PrivateChatAway {
+        peer: u16,
+    },
+    PrivateChatBack {
+        peer: u16,
+    },
+    Paged {
+        from_user: u16,
+    },
+    TtsMessage {
+        user_id: u16,
+        message: String,
+    },
     Disconnected,
 }
 

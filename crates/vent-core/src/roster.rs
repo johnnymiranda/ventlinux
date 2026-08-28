@@ -79,17 +79,40 @@ impl Roster {
             users_by_ch: &HashMap<u16, Vec<&User>>,
             parent: u16,
             depth: usize,
+            visited: &mut HashSet<u16>,
         ) {
             if let Some(channels) = by_parent.get(&parent) {
                 for ch in channels {
+                    if !visited.insert(ch.id) {
+                        continue;
+                    }
                     rows.push((depth, TreeNode::Channel((*ch).clone())));
                     add_users(rows, users_by_ch, ch.id, depth + 1);
-                    add_channels(rows, by_parent, users_by_ch, ch.id, depth + 1);
+                    add_channels(rows, by_parent, users_by_ch, ch.id, depth + 1, visited);
                 }
             }
         }
         add_users(&mut rows, &users_by_ch, 0, 0);
-        add_channels(&mut rows, &by_parent, &users_by_ch, 0, 0);
+        let mut visited = HashSet::new();
+        add_channels(&mut rows, &by_parent, &users_by_ch, 0, 0, &mut visited);
+
+        // A transiently missing parent should not hide a channel, and malformed
+        // cyclic parent data must not recurse forever. Render each remaining
+        // component once at the root.
+        let mut remaining: Vec<_> = self
+            .channels
+            .values()
+            .filter(|ch| !visited.contains(&ch.id))
+            .collect();
+        remaining.sort_by(|a, b| a.name.cmp(&b.name));
+        for ch in remaining {
+            if !visited.insert(ch.id) {
+                continue;
+            }
+            rows.push((0, TreeNode::Channel(ch.clone())));
+            add_users(&mut rows, &users_by_ch, ch.id, 1);
+            add_channels(&mut rows, &by_parent, &users_by_ch, ch.id, 1, &mut visited);
+        }
         rows
     }
 
@@ -102,5 +125,56 @@ impl Roster {
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| format!("#{id}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(id: u16, parent: u16, name: &str) -> Channel {
+        Channel {
+            id,
+            parent,
+            name: name.into(),
+            phonetic: String::new(),
+            comment: String::new(),
+            password_protected: false,
+            codec: 0,
+            codec_format: 0,
+        }
+    }
+
+    #[test]
+    fn flattened_tree_includes_orphaned_channels() {
+        let mut roster = Roster::default();
+        roster.channels.insert(2, channel(2, 99, "Orphan"));
+
+        let rows = roster.flattened_tree();
+
+        assert!(matches!(
+            rows.as_slice(),
+            [(0, TreeNode::Channel(ch))] if ch.id == 2
+        ));
+    }
+
+    #[test]
+    fn flattened_tree_handles_parent_cycles_once() {
+        let mut roster = Roster::default();
+        roster.channels.insert(1, channel(1, 2, "A"));
+        roster.channels.insert(2, channel(2, 1, "B"));
+
+        let ids: Vec<_> = roster
+            .flattened_tree()
+            .into_iter()
+            .filter_map(|(_, node)| match node {
+                TreeNode::Channel(ch) => Some(ch.id),
+                TreeNode::User(_) => None,
+            })
+            .collect();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
     }
 }

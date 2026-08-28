@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+type SamplePush = Arc<dyn Fn(&[i16]) + Send + Sync>;
+
 #[derive(Clone, Debug)]
 pub struct AudioDevice {
     pub name: String,
@@ -123,9 +125,7 @@ pub struct Player {
 impl Player {
     pub fn start(output_name: Option<&str>) -> Result<Self> {
         let device = find_device(false, output_name)?;
-        let supported = device
-            .default_output_config()
-            .context("output config")?;
+        let supported = device.default_output_config().context("output config")?;
         let sample_format = supported.sample_format();
         let config: StreamConfig = supported.into();
         let out_rate = config.sample_rate.0;
@@ -149,6 +149,12 @@ impl Player {
             SampleFormat::I16 => device.build_output_stream(
                 &config,
                 move |data: &mut [i16], _| mix.lock().unwrap().fill_i16(data),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::U16 => device.build_output_stream(
+                &config,
+                move |data: &mut [u16], _| mix.lock().unwrap().fill_u16(data),
                 err_fn,
                 None,
             )?,
@@ -187,7 +193,7 @@ impl Player {
 
 impl PlayerHandle {
     pub fn play(&self, user_id: u16, rate: u32, channels: u8, pcm: &[u8]) {
-        if pcm.is_empty() {
+        if pcm.is_empty() || rate == 0 {
             return;
         }
         let mut g = self.inner.lock().unwrap();
@@ -195,8 +201,9 @@ impl PlayerHandle {
             return;
         }
         let ch = channels.max(1);
-        let samples: Vec<i16> = pcm
-            .chunks_exact(2)
+        let (sample_bytes, _) = pcm.as_chunks::<2>();
+        let samples: Vec<i16> = sample_bytes
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]))
             .collect();
         let voice = g.voices.entry(user_id).or_insert_with(|| Voice {
@@ -222,12 +229,17 @@ impl PlayerHandle {
     }
 
     pub fn set_muted(&self, muted: bool) {
-        self.inner.lock().unwrap().master_mute = muted;
+        let mut g = self.inner.lock().unwrap();
+        g.master_mute = muted;
+        if muted {
+            g.voices.clear();
+        }
     }
     pub fn set_user_muted(&self, user_id: u16, muted: bool) {
         let mut g = self.inner.lock().unwrap();
         if muted {
             g.muted_users.insert(user_id);
+            g.voices.remove(&user_id);
         } else {
             g.muted_users.remove(&user_id);
         }
@@ -248,6 +260,9 @@ impl MixerInner {
         for (id, voice) in self.voices.iter_mut() {
             let ch = voice.channels as usize;
             if voice.samples.len() < ch {
+                if voice.samples.is_empty() {
+                    dead.push(*id);
+                }
                 continue;
             }
             let step = voice.rate as f64 / out_rate;
@@ -296,6 +311,15 @@ impl MixerInner {
             }
         }
     }
+    fn fill_u16(&mut self, data: &mut [u16]) {
+        let ch = self.out_channels as usize;
+        for frame in data.chunks_mut(ch) {
+            let s = ((self.next_sample() * 0.5 + 0.5) * u16::MAX as f32) as u16;
+            for c in frame.iter_mut() {
+                *c = s;
+            }
+        }
+    }
 }
 
 pub struct Capture {
@@ -321,7 +345,7 @@ impl Capture {
         let target = (rate as usize / 25).max(160); // ~40ms
         let on_chunk = Arc::new(on_chunk);
 
-        let push: Arc<dyn Fn(&[i16]) + Send + Sync> = {
+        let push: SamplePush = {
             let buf = buf.clone();
             let on_chunk = on_chunk.clone();
             let run = run.clone();
@@ -371,6 +395,21 @@ impl Capture {
                     None,
                 )?
             }
+            SampleFormat::U16 => {
+                let push = push.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[u16], _| {
+                        let mono: Vec<i16> = data
+                            .chunks(channels)
+                            .map(|f| (i32::from(f[0]) - 32768) as i16)
+                            .collect();
+                        push(&mono);
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
             other => return Err(anyhow!("unsupported input format {other:?}")),
         };
         stream.play()?;
@@ -388,5 +427,59 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle() -> PlayerHandle {
+        PlayerHandle {
+            inner: Arc::new(Mutex::new(MixerInner {
+                voices: HashMap::new(),
+                muted_users: HashSet::new(),
+                master_mute: false,
+                out_rate: 48_000,
+                out_channels: 2,
+            })),
+        }
+    }
+
+    fn pcm(samples: &[i16]) -> Vec<u8> {
+        samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn master_mute_discards_buffered_audio() {
+        let handle = handle();
+        handle.play(7, 48_000, 1, &pcm(&[1000, 2000]));
+        assert!(!handle.inner.lock().unwrap().voices.is_empty());
+
+        handle.set_muted(true);
+
+        assert!(handle.inner.lock().unwrap().voices.is_empty());
+    }
+
+    #[test]
+    fn user_mute_discards_only_that_users_buffer() {
+        let handle = handle();
+        handle.play(7, 48_000, 1, &pcm(&[1000]));
+        handle.play(8, 48_000, 1, &pcm(&[2000]));
+
+        handle.set_user_muted(7, true);
+
+        let inner = handle.inner.lock().unwrap();
+        assert!(!inner.voices.contains_key(&7));
+        assert!(inner.voices.contains_key(&8));
+    }
+
+    #[test]
+    fn zero_rate_audio_is_ignored() {
+        let handle = handle();
+
+        handle.play(7, 0, 1, &pcm(&[1000]));
+
+        assert!(handle.inner.lock().unwrap().voices.is_empty());
     }
 }

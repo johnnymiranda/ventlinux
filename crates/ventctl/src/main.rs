@@ -5,12 +5,14 @@
 //!
 //! `V3_DEBUG=1` enables libventrilo3 debug output.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use vent_audio::{Capture, Player};
 use vent_core::{Client, CoreEvent, Roster, TreeNode};
 
@@ -65,7 +67,7 @@ fn main() -> Result<()> {
         );
         std::process::exit(1);
     }
-    let (host, port) = split_host(hostport);
+    let (host, port) = split_host(hostport)?;
     let stay = cli.stay || cli.talk;
     let talk = cli.talk;
 
@@ -102,10 +104,21 @@ fn main() -> Result<()> {
     println!("connecting to {host}:{port} as {username}…");
     let rx = Client::connect(&host, port, username, &cli.password, "");
 
-    for ev in rx {
+    loop {
         while toggle_rx.try_recv().is_ok() {
-            toggle_talk(&transmitting, &mut capture);
+            if Client::is_logged_in() {
+                toggle_talk(&transmitting, &mut capture);
+            }
         }
+        let ev = match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(ev) => ev,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let removed_user = match &ev {
+            CoreEvent::UserRemoved(id) => roster.users.get(id).map(|u| u.name.clone()),
+            _ => None,
+        };
         roster.apply(&ev);
         match &ev {
             CoreEvent::Status { percent, message } => println!("[{percent}%] {message}"),
@@ -155,9 +168,9 @@ fn main() -> Result<()> {
             CoreEvent::UserUpserted(u) if Client::is_logged_in() && !u.name.is_empty() => {
                 println!("{} → {}", u.name, roster.channel_name(u.channel_id));
             }
-            CoreEvent::UserRemoved(id) => {
-                if let Some(u) = roster.users.get(id) {
-                    println!("{} logged out", u.name);
+            CoreEvent::UserRemoved(_) => {
+                if let Some(name) = removed_user.as_deref() {
+                    println!("{name} logged out");
                 }
             }
             CoreEvent::MovedToChannel(id) => {
@@ -209,16 +222,36 @@ fn main() -> Result<()> {
             _ => {}
         }
     }
+    if transmitting.load(Ordering::SeqCst) {
+        capture = None;
+        Client::stop_transmit();
+    }
+    Client::clear_audio_sink();
+    drop(capture);
     Ok(())
 }
 
-fn split_host(s: &str) -> (String, u16) {
-    if let Some((h, p)) = s.rsplit_once(':') {
-        if let Ok(port) = p.parse() {
-            return (h.to_string(), port);
-        }
+fn split_host(s: &str) -> Result<(String, u16)> {
+    if s.is_empty() {
+        bail!("host cannot be empty");
     }
-    (s.to_string(), 3784)
+    let colon_count = s.bytes().filter(|b| *b == b':').count();
+    if colon_count > 1 || s.starts_with('[') {
+        bail!("IPv6 server addresses are not supported by libventrilo3");
+    }
+    if let Some((host, port)) = s.split_once(':') {
+        if host.is_empty() {
+            bail!("host cannot be empty");
+        }
+        let port = port
+            .parse::<u16>()
+            .with_context(|| format!("invalid server port '{port}'"))?;
+        if port == 0 {
+            bail!("server port must be between 1 and 65535");
+        }
+        return Ok((host.to_string(), port));
+    }
+    Ok((s.to_string(), 3784))
 }
 
 fn print_tree(roster: &Roster) {
@@ -258,5 +291,38 @@ fn toggle_talk(transmitting: &AtomicBool, capture: &mut Option<Capture>) {
                 eprintln!(">>> {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_host_uses_default_port() {
+        assert_eq!(
+            split_host("vent.example.com").unwrap(),
+            ("vent.example.com".into(), 3784)
+        );
+    }
+
+    #[test]
+    fn split_host_accepts_explicit_port() {
+        assert_eq!(
+            split_host("127.0.0.1:4000").unwrap(),
+            ("127.0.0.1".into(), 4000)
+        );
+    }
+
+    #[test]
+    fn split_host_rejects_invalid_ports() {
+        assert!(split_host("vent.example.com:nope").is_err());
+        assert!(split_host("vent.example.com:0").is_err());
+    }
+
+    #[test]
+    fn split_host_rejects_unsupported_ipv6() {
+        assert!(split_host("2001:db8::1").is_err());
+        assert!(split_host("[::1]:3784").is_err());
     }
 }

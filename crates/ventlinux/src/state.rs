@@ -32,7 +32,6 @@ pub struct Session {
     pub sound_muted: bool,
     pub mic_muted: bool,
     pub transmit_mode: TransmitMode,
-    #[allow(dead_code)]
     pub vox_level: f32,
     pub chat_open: bool,
     pub chat_log: Vec<String>,
@@ -152,6 +151,12 @@ impl Session {
         if self.status != Status::Disconnected {
             return;
         }
+        let server_changed = self.conn.as_ref().is_some_and(|(host, port, user, _)| {
+            host != &server.host || *port != server.port || user != &server.username
+        });
+        if server_changed {
+            self.last_channel = 0;
+        }
         self.conn = Some((
             server.host.clone(),
             server.port,
@@ -178,6 +183,9 @@ impl Session {
         self.roster = Roster::default();
         self.chat_log.clear();
         self.own_channel_id = 0;
+        self.own_user_id = 0;
+        self.codec_label.clear();
+        self.motd = None;
         self.ping = None;
 
         match Player::start(nonempty(&self.config.output_device)) {
@@ -264,16 +272,21 @@ impl Session {
             self.on_stream_end();
             dirty = true;
         }
-        if let Ok(g) = VOX.lock() {
-            if let Some((_, open)) = g.as_ref() {
-                if self.transmit_mode == TransmitMode::Vox && self.transmitting != *open {
-                    self.transmitting = *open;
-                    dirty = true;
-                }
+        let vox_state = VOX.lock().ok().and_then(|g| {
+            g.as_ref()
+                .map(|(gate, open)| (gate.last_level_dbfs(), *open))
+        });
+        if let Some((level, open)) = vox_state {
+            self.vox_level = level;
+            self.vox_open = open;
+            if self.transmit_mode == TransmitMode::Vox && self.transmitting != open {
+                self.transmitting = open;
+                dirty = true;
             }
         }
         if let Some(at) = self.next_retry {
-            if Instant::now() >= at && self.status == Status::Reconnecting && !self.want_disconnect {
+            if Instant::now() >= at && self.status == Status::Reconnecting && !self.want_disconnect
+            {
                 self.next_retry = None;
                 self.start_session();
                 dirty = true;
@@ -310,6 +323,9 @@ impl Session {
                 }
                 if self.last_channel != 0 {
                     Client::join_channel(self.last_channel, "");
+                }
+                if self.chat_open {
+                    Client::join_chat();
                 }
                 self.apply_vox_state();
             }
@@ -410,13 +426,43 @@ impl Session {
 
     pub fn set_mic_muted(&mut self, muted: bool) {
         self.mic_muted = muted;
-        if muted {
-            self.stop_talk();
-        }
         self.vox.set_muted(muted);
+        match self.transmit_mode {
+            TransmitMode::Ptt if muted => self.stop_talk(),
+            TransmitMode::Vox => {
+                let was_open = VOX
+                    .lock()
+                    .ok()
+                    .and_then(|mut runtime| {
+                        runtime.as_mut().map(|(gate, open)| {
+                            gate.set_muted(muted);
+                            let was_open = *open;
+                            if muted && was_open {
+                                gate.reset();
+                                *open = false;
+                            }
+                            was_open
+                        })
+                    })
+                    .unwrap_or(false);
+                if was_open && muted {
+                    Client::stop_transmit();
+                    self.vox_open = false;
+                    self.transmitting = false;
+                }
+            }
+            TransmitMode::Ptt => {}
+        }
     }
 
     pub fn set_transmit_mode(&mut self, mode: TransmitMode) {
+        if self.transmit_mode == mode {
+            return;
+        }
+        match self.transmit_mode {
+            TransmitMode::Ptt => self.stop_talk(),
+            TransmitMode::Vox => self.stop_vox_capture(),
+        }
         self.transmit_mode = mode;
         self.config.transmit_mode = match mode {
             TransmitMode::Ptt => "ptt".into(),
@@ -426,17 +472,21 @@ impl Session {
         self.apply_vox_state();
     }
 
-    #[allow(dead_code)]
     pub fn set_vox_sensitivity(&mut self, db: f32) {
         self.config.vox_sensitivity = db;
         self.vox.config.open_threshold_dbfs = db;
         self.vox.config.close_threshold_dbfs = db - 10.0;
+        if let Ok(mut runtime) = VOX.lock() {
+            if let Some((gate, _)) = runtime.as_mut() {
+                gate.config.open_threshold_dbfs = db;
+                gate.config.close_threshold_dbfs = db - 10.0;
+            }
+        }
         self.persist();
     }
 
     fn apply_vox_state(&mut self) {
         if self.status == Status::Connected && self.transmit_mode == TransmitMode::Vox {
-            self.stop_talk();
             self.start_vox_capture();
         } else {
             self.stop_vox_capture();
@@ -465,15 +515,30 @@ impl Session {
             }
         }) {
             Ok(c) => self.capture = Some(c),
-            Err(e) => self.last_error = Some(format!("microphone: {e}")),
+            Err(e) => {
+                if let Ok(mut runtime) = VOX.lock() {
+                    *runtime = None;
+                }
+                self.last_error = Some(format!("microphone: {e}"));
+            }
         }
     }
 
     fn stop_vox_capture(&mut self) {
-        self.capture = None;
-        if self.vox_open {
+        let runtime = VOX.lock().ok().and_then(|mut runtime| runtime.take());
+        let had_vox = runtime.is_some() || self.vox_open;
+        let was_open = runtime
+            .as_ref()
+            .map(|(_, open)| *open)
+            .unwrap_or(self.vox_open);
+        if had_vox {
+            self.capture = None;
+        }
+        if was_open {
             Client::stop_transmit();
-            self.vox_open = false;
+        }
+        self.vox_open = false;
+        if had_vox {
             self.transmitting = false;
         }
     }
@@ -555,7 +620,9 @@ static VOX: Mutex<Option<(StaticGate, bool)>> = Mutex::new(None);
 
 fn vox_audio_thread(pcm: &[u8], rate: u32) {
     let mut g = VOX.lock().unwrap();
-    let (gate, open) = g.get_or_insert_with(|| (VoxGate::default(), false));
+    let Some((gate, open)) = g.as_mut() else {
+        return;
+    };
     match gate.process(pcm, rate) {
         VoxAction::Idle => {}
         VoxAction::Open(chunks) => {

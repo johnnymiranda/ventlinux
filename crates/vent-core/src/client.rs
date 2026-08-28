@@ -55,7 +55,9 @@ impl Client {
     ) -> Receiver<CoreEvent> {
         if RUNNING.swap(true, Ordering::SeqCst) {
             let (tx, rx) = mpsc::channel();
-            drop(tx);
+            let _ = tx.send(CoreEvent::LoginFailed(
+                "another Ventrilo session is already running".into(),
+            ));
             return rx;
         }
 
@@ -78,11 +80,17 @@ impl Client {
         let password = password.to_string();
         let phonetic = phonetic.to_string();
 
-        thread::Builder::new()
+        let feeder_tx = tx.clone();
+        if let Err(e) = thread::Builder::new()
             .name("v3-feeder".into())
             .stack_size(1 << 21)
-            .spawn(move || feeder(tx, server, username, password, phonetic))
-            .expect("spawn feeder");
+            .spawn(move || feeder(feeder_tx, server, username, password, phonetic))
+        {
+            RUNNING.store(false, Ordering::SeqCst);
+            let _ = tx.send(CoreEvent::LoginFailed(format!(
+                "could not start connection thread: {e}"
+            )));
+        }
         rx
     }
 
@@ -122,18 +130,24 @@ impl Client {
     }
 
     pub fn send_pcm(pcm: &[u8], rate: u32, stereo: bool) {
-        if pcm.is_empty() {
+        let (usable_len, max_len) = pcm_limits(pcm.len(), stereo);
+        if usable_len == 0 || rate == 0 {
             return;
         }
+        // libventrilo3 copies each call into v3_event_data::sample. Keep every
+        // call within that fixed-size C buffer even if this safe wrapper is
+        // handed an unexpectedly large slice.
         let _g = cmd().lock().unwrap();
-        unsafe {
-            v3::v3_send_audio(
-                v3::V3_AUDIO_SENDTYPE_U2CCUR as u16,
-                rate,
-                pcm.as_ptr() as *mut u8,
-                pcm.len() as u32,
-                stereo as u8,
-            );
+        for chunk in pcm[..usable_len].chunks(max_len) {
+            unsafe {
+                v3::v3_send_audio(
+                    v3::V3_AUDIO_SENDTYPE_U2CCUR as u16,
+                    rate,
+                    chunk.as_ptr() as *mut u8,
+                    chunk.len() as u32,
+                    stereo as u8,
+                );
+            }
         }
     }
 
@@ -227,10 +241,19 @@ fn feeder(
     password: String,
     phonetic: String,
 ) {
-    let s = CString::new(server).unwrap();
-    let u = CString::new(username).unwrap();
-    let p = CString::new(password).unwrap();
-    let ph = CString::new(phonetic).unwrap();
+    let fields = (
+        CString::new(server),
+        CString::new(username),
+        CString::new(password),
+        CString::new(phonetic),
+    );
+    let (Ok(s), Ok(u), Ok(p), Ok(ph)) = fields else {
+        let _ = tx.send(CoreEvent::LoginFailed(
+            "server, username, password, and phonetic name cannot contain NUL characters".into(),
+        ));
+        RUNNING.store(false, Ordering::SeqCst);
+        return;
+    };
 
     unsafe {
         // Force the event-queue mutex to exist before login (see VentMac V3Client).
@@ -252,11 +275,26 @@ fn feeder(
     }
 
     let consumer_tx = tx.clone();
-    thread::Builder::new()
+    if let Err(e) = thread::Builder::new()
         .name("v3-consumer".into())
         .stack_size(1 << 21)
         .spawn(move || consumer(consumer_tx))
-        .expect("spawn consumer");
+    {
+        let _ = tx.send(CoreEvent::ErrorMessage {
+            message: format!("could not start event thread: {e}"),
+            disconnected: true,
+        });
+        unsafe { v3::v3_logout() };
+        loop {
+            let msg = unsafe { v3::_v3_recv(v3::V3_BLOCK as i32) };
+            if msg.is_null() {
+                break;
+            }
+            unsafe { v3::_v3_process_message(msg) };
+        }
+        RUNNING.store(false, Ordering::SeqCst);
+        return;
+    }
 
     loop {
         let msg = unsafe { v3::_v3_recv(v3::V3_BLOCK as i32) };
@@ -286,6 +324,14 @@ fn consumer(tx: mpsc::Sender<CoreEvent>) {
         }
     }
     RUNNING.store(false, Ordering::SeqCst);
+}
+
+fn pcm_limits(len: usize, stereo: bool) -> (usize, usize) {
+    let frame_bytes = if stereo { 4 } else { 2 };
+    let usable_len = len - (len % frame_bytes);
+    let c_buffer_len = std::mem::size_of::<v3::v3_event_data>();
+    let max_len = c_buffer_len - (c_buffer_len % frame_bytes);
+    (usable_len, max_len)
 }
 
 unsafe fn read_user(id: u16) -> Option<User> {
@@ -396,9 +442,7 @@ unsafe fn translate(ev: *mut v3::_v3_event) -> Option<CoreEvent> {
         t if t == v3::_v3_events_V3_EVENT_USER_TALK_END
             || t == v3::_v3_events_V3_EVENT_USER_TALK_MUTE =>
         {
-            Some(CoreEvent::TalkEnded {
-                user_id: e.user.id,
-            })
+            Some(CoreEvent::TalkEnded { user_id: e.user.id })
         }
         t if t == v3::_v3_events_V3_EVENT_PLAY_AUDIO => {
             if e.data.is_null() {
@@ -439,9 +483,11 @@ unsafe fn translate(ev: *mut v3::_v3_event) -> Option<CoreEvent> {
             user_id: e.user.id,
             message: event_chat_message(e),
         }),
-        t if t == v3::_v3_events_V3_EVENT_PRIVATE_CHAT_START => Some(CoreEvent::PrivateChatStarted {
-            peer: privchat_peer(e),
-        }),
+        t if t == v3::_v3_events_V3_EVENT_PRIVATE_CHAT_START => {
+            Some(CoreEvent::PrivateChatStarted {
+                peer: privchat_peer(e),
+            })
+        }
         t if t == v3::_v3_events_V3_EVENT_PRIVATE_CHAT_END => Some(CoreEvent::PrivateChatEnded {
             peer: privchat_peer(e),
         }),
@@ -473,5 +519,21 @@ unsafe fn translate(ev: *mut v3::_v3_event) -> Option<CoreEvent> {
         }
         t if t == v3::_v3_events_V3_EVENT_DISCONNECT => Some(CoreEvent::Disconnected),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pcm_limits_drop_incomplete_frames_and_bound_ffi_chunks() {
+        let (mono_len, mono_max) = pcm_limits(65_537, false);
+        assert_eq!(mono_len, 65_536);
+        assert_eq!(mono_max, 32_768);
+
+        let (stereo_len, stereo_max) = pcm_limits(65_538, true);
+        assert_eq!(stereo_len, 65_536);
+        assert_eq!(stereo_max, 32_768);
     }
 }

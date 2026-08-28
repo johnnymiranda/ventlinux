@@ -142,8 +142,11 @@ fn watch_loop(
 fn open_devices() -> Vec<Device> {
     let mut out = Vec::new();
     for (_, d) in evdev::enumerate() {
-        let _ = d.set_nonblocking(true);
-        out.push(d);
+        // A blocking descriptor would stall the watcher on the first idle
+        // device and prevent PTT events from every other keyboard or mouse.
+        if d.set_nonblocking(true).is_ok() {
+            out.push(d);
+        }
     }
     out
 }
@@ -188,7 +191,11 @@ fn binding_from_code(code: u16) -> Binding {
         c if c == KeyCode::BTN_EXTRA.0 => (BindingKind::Mouse, "Mouse 5".into()),
         _ => (BindingKind::Key, key_name(code)),
     };
-    Binding { kind, code, display }
+    Binding {
+        kind,
+        code,
+        display,
+    }
 }
 
 fn key_name(code: u16) -> String {

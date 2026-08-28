@@ -2,11 +2,10 @@ use crate::config::SavedServer;
 use crate::state::{Session, Status, TransmitMode};
 use adw::prelude::*;
 use gtk::glib;
-use gtk::prelude::*;
 use gtk::{
-    Align, Box as GtkBox, Button, CheckButton, ComboBoxText, Entry, HeaderBar, Label, ListBox,
-    ListBoxRow, Orientation, PasswordEntry, PolicyType, Scale, ScrolledWindow, Separator, SpinButton,
-    Stack, ToggleButton, Window,
+    Align, Box as GtkBox, Button, CheckButton, DropDown, Entry, HeaderBar, Label, ListBox,
+    ListBoxRow, Orientation, PasswordEntry, PolicyType, Scale, ScrolledWindow, Separator,
+    SpinButton, Stack, ToggleButton, Window,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -296,7 +295,8 @@ fn fill_servers(list: &ListBox, session: &Rc<RefCell<Session>>, hint: &Label) {
             sess.borrow_mut().select_server(id.clone());
             sess.borrow_mut().last_error = None;
             if n_press >= 2 {
-                if let Some(srv) = sess.borrow().selected_server() {
+                let server = sess.borrow().selected_server();
+                if let Some(srv) = server {
                     sess.borrow_mut().connect(&srv);
                 }
             }
@@ -500,10 +500,11 @@ fn preferences(parent: &impl IsA<gtk::Window>, session: &Rc<RefCell<Session>>) {
 
     let (ins, outs) = vent_audio::list_devices();
     page.append(&heading("Microphone"));
-    let in_combo = device_combo(&ins, true, &session.borrow().config.input_device);
+    let (in_combo, in_ids) = device_dropdown(&ins, true, &session.borrow().config.input_device);
     page.append(&in_combo);
     page.append(&heading("Speakers / headset"));
-    let out_combo = device_combo(&outs, false, &session.borrow().config.output_device);
+    let (out_combo, out_ids) =
+        device_dropdown(&outs, false, &session.borrow().config.output_device);
     page.append(&out_combo);
 
     let close = Button::with_label("Close");
@@ -552,15 +553,21 @@ fn preferences(parent: &impl IsA<gtk::Window>, session: &Rc<RefCell<Session>>) {
     });
 
     let sess = session.clone();
-    in_combo.connect_changed(move |c| {
-        let id = c.active_id().map(|s| s.to_string()).unwrap_or_default();
+    in_combo.connect_selected_notify(move |c| {
+        let id = in_ids
+            .get(c.selected() as usize)
+            .cloned()
+            .unwrap_or_default();
         let mut s = sess.borrow_mut();
         s.config.input_device = id;
         s.persist();
     });
     let sess = session.clone();
-    out_combo.connect_changed(move |c| {
-        let id = c.active_id().map(|s| s.to_string()).unwrap_or_default();
+    out_combo.connect_selected_notify(move |c| {
+        let id = out_ids
+            .get(c.selected() as usize)
+            .cloned()
+            .unwrap_or_default();
         let mut s = sess.borrow_mut();
         s.config.output_device = id;
         s.persist();
@@ -571,20 +578,24 @@ fn preferences(parent: &impl IsA<gtk::Window>, session: &Rc<RefCell<Session>>) {
     dlg.present();
 }
 
-fn device_combo(devs: &[AudioDevice], input: bool, current: &str) -> ComboBoxText {
-    let combo = ComboBoxText::new();
-    combo.append(Some(""), "System default (Pulse/PipeWire)");
+fn device_dropdown(
+    devs: &[AudioDevice],
+    input: bool,
+    current: &str,
+) -> (DropDown, Rc<Vec<String>>) {
+    let mut ids = vec![String::new()];
+    let mut labels = vec!["System default (Pulse/PipeWire)".to_string()];
     for d in devs {
         if (input && d.is_input) || (!input && d.is_output) {
-            combo.append(Some(&d.name), &d.name);
+            ids.push(d.name.clone());
+            labels.push(d.name.clone());
         }
     }
-    if current.is_empty() {
-        combo.set_active_id(Some(""));
-    } else {
-        combo.set_active_id(Some(current));
-    }
-    combo
+    let label_refs: Vec<_> = labels.iter().map(String::as_str).collect();
+    let dropdown = DropDown::from_strings(&label_refs);
+    let selected = ids.iter().position(|id| id == current).unwrap_or(0);
+    dropdown.set_selected(selected as u32);
+    (dropdown, Rc::new(ids))
 }
 
 fn build_main(session: Rc<RefCell<Session>>, _parent: adw::ApplicationWindow) -> GtkBox {
