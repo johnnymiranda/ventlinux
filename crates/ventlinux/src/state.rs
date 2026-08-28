@@ -206,6 +206,11 @@ impl Session {
             Err(e) => self.last_error = Some(format!("audio output: {e}")),
         }
 
+        // Resolve the microphone now, in the background, so the first PTT press
+        // is not delayed by ALSA device discovery.
+        let input = self.config.input_device.clone();
+        std::thread::spawn(move || vent_audio::prewarm_input(nonempty(&input)));
+
         self.events = Some(Client::connect(&host, port, &user, &pass, ""));
     }
 

@@ -8,7 +8,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 type SamplePush = Arc<dyn Fn(&[i16]) + Send + Sync>;
 
@@ -46,6 +46,57 @@ pub fn list_devices() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
         }
     }
     (inputs, outputs)
+}
+
+/// Resolved devices, keyed by `(want_input, configured name)`.
+///
+/// Resolving walks ALSA's PCM list and probes each entry, which costs ~500ms
+/// once a specific card is configured — far too slow to repeat on every
+/// push-to-talk press, where it would clip the start of every transmission.
+static DEVICE_CACHE: OnceLock<Mutex<HashMap<(bool, String), Device>>> = OnceLock::new();
+
+fn device_cache() -> &'static Mutex<HashMap<(bool, String), Device>> {
+    DEVICE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_key(want_input: bool, name: Option<&str>) -> (bool, String) {
+    (want_input, name.unwrap_or_default().to_string())
+}
+
+/// `find_device`, memoised. The empty name resolves to the Pulse/PipeWire
+/// virtual PCM, which stays correct when the session's default device changes,
+/// so the entry does not go stale.
+fn resolve_device(want_input: bool, name: Option<&str>) -> Result<Device> {
+    let key = cache_key(want_input, name);
+    if let Some(device) = device_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+    {
+        return Ok(device);
+    }
+    let device = find_device(want_input, name)?;
+    if let Ok(mut cache) = device_cache().lock() {
+        cache.insert(key, device.clone());
+    }
+    Ok(device)
+}
+
+/// Resolve the capture device ahead of time so the first push-to-talk press
+/// does not pay for it. Blocks, so call it off the UI thread; failures are
+/// ignored because the real attempt will report them.
+pub fn prewarm_input(name: Option<&str>) {
+    let _ = resolve_device(true, name);
+}
+
+/// Forget a cached device. Returns whether there was one, so callers can skip a
+/// pointless retry when the failure did not come from a stale entry.
+fn forget_device(want_input: bool, name: Option<&str>) -> bool {
+    let key = cache_key(want_input, name);
+    device_cache()
+        .lock()
+        .map(|mut cache| cache.remove(&key).is_some())
+        .unwrap_or(false)
 }
 
 fn find_device(want_input: bool, name: Option<&str>) -> Result<Device> {
@@ -124,7 +175,19 @@ pub struct Player {
 
 impl Player {
     pub fn start(output_name: Option<&str>) -> Result<Self> {
-        let device = find_device(false, output_name)?;
+        let err = match Self::open(resolve_device(false, output_name)?) {
+            Ok(player) => return Ok(player),
+            Err(e) => e,
+        };
+        // A cached device can go stale if it was unplugged. Re-resolve once;
+        // if nothing was cached the retry would just repeat the same failure.
+        if !forget_device(false, output_name) {
+            return Err(err);
+        }
+        Self::open(find_device(false, output_name)?)
+    }
+
+    fn open(device: Device) -> Result<Self> {
         let supported = device.default_output_config().context("output config")?;
         let sample_format = supported.sample_format();
         let config: StreamConfig = supported.into();
@@ -333,7 +396,23 @@ impl Capture {
     where
         F: Fn(&[u8], u32) + Send + Sync + 'static,
     {
-        let device = find_device(true, input_name)?;
+        let on_chunk = Arc::new(on_chunk);
+        let err = match Self::open(resolve_device(true, input_name)?, on_chunk.clone()) {
+            Ok(capture) => return Ok(capture),
+            Err(e) => e,
+        };
+        // A cached device can go stale if it was unplugged. Re-resolve once;
+        // if nothing was cached the retry would just repeat the same failure.
+        if !forget_device(true, input_name) {
+            return Err(err);
+        }
+        Self::open(find_device(true, input_name)?, on_chunk)
+    }
+
+    fn open<F>(device: Device, on_chunk: Arc<F>) -> Result<Self>
+    where
+        F: Fn(&[u8], u32) + Send + Sync + 'static,
+    {
         let supported = device.default_input_config().context("input config")?;
         let sample_format = supported.sample_format();
         let config: StreamConfig = supported.into();
@@ -343,7 +422,6 @@ impl Capture {
         let run = running.clone();
         let buf = Arc::new(Mutex::new(Vec::<i16>::new()));
         let target = (rate as usize / 25).max(160); // ~40ms
-        let on_chunk = Arc::new(on_chunk);
 
         let push: SamplePush = {
             let buf = buf.clone();

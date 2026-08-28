@@ -564,8 +564,13 @@ fn preferences(parent: &impl IsA<gtk::Window>, session: &Rc<RefCell<Session>>) {
             .cloned()
             .unwrap_or_default();
         let mut s = sess.borrow_mut();
-        s.config.input_device = id;
+        s.config.input_device = id.clone();
         s.persist();
+        drop(s);
+        // Resolve the newly picked microphone now rather than on the next press.
+        std::thread::spawn(move || {
+            vent_audio::prewarm_input(if id.is_empty() { None } else { Some(&id) })
+        });
     });
     let sess = session.clone();
     out_combo.connect_selected_notify(move |c| {
