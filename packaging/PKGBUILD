@@ -1,0 +1,51 @@
+# Maintainer: Johnathan Miranda <john@cryptex-labs.com>
+#
+# Builds VentLinux from the tip of main. Run from this directory:
+#
+#     makepkg -si
+#
+# pkgver is regenerated from the clone on every build, so the value committed
+# here is only a starting point.
+#
+# To turn this into a tagged-release package instead: drop pkgver(), rename
+# pkgname to $_pkgname, point source= at
+#   "$_pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+# set pkgver to the tag, run `updpkgsums`, and drop provides/conflicts.
+
+_pkgname=ventlinux
+pkgname=ventlinux-git
+pkgver=r5.fc0d2e8
+pkgrel=1
+pkgdesc="Native Linux client for Ventrilo 3 voice servers, with global push-to-talk"
+arch=('x86_64')
+url="https://github.com/johnnymiranda/ventlinux"
+license=('GPL-3.0-or-later')
+depends=('gtk4' 'libadwaita' 'speex' 'speexdsp' 'opus' 'alsa-lib')
+makedepends=('git' 'rust' 'clang' 'pkgconf')
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+source=("$_pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "$_pkgname"
+	printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+	cd "$_pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+	cd "$_pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release
+}
+
+package() {
+	cd "$_pkgname"
+	make DESTDIR="$pkgdir" PREFIX=/usr install
+}

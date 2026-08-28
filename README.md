@@ -43,13 +43,13 @@ is that client.
 Needs a Rust toolchain (1.80+), clang (for bindgen), and:
 
 ```
-speex speexdsp opus gtk4 libadwaita pkgconf
+speex speexdsp opus alsa-lib gtk4 libadwaita pkgconf
 ```
 
 On Arch / Omarchy:
 
 ```sh
-sudo pacman -S --needed rust clang speex speexdsp opus gtk4 libadwaita pkgconf
+sudo pacman -S --needed rust clang speex speexdsp opus alsa-lib gtk4 libadwaita pkgconf
 git clone https://github.com/johnnymiranda/ventlinux.git
 cd ventlinux
 cargo build --release
@@ -63,6 +63,32 @@ Binaries land in `target/release/`:
 ```
 
 `V3_DEBUG=1` (or `2` / `3`) enables libventrilo3 debug output.
+
+## Install
+
+### Arch / Omarchy (recommended)
+
+```sh
+cd packaging
+makepkg -si
+```
+
+Builds from the tip of `main` and installs a real package, so `pacman -R
+ventlinux-git` removes it cleanly.
+
+### Any distro
+
+```sh
+make
+sudo make install          # /usr/local
+make install PREFIX=~/.local   # or just for you, no sudo
+```
+
+`make uninstall` reverses it (pass the same `PREFIX`).
+
+Either way you get `ventlinux` and `ventctl` on `PATH` plus a desktop entry, so
+VentLinux shows up in your application launcher. Then add yourself to the
+`input` group for push-to-talk — see [Global PTT](#global-ptt).
 
 ## Connecting to a server
 

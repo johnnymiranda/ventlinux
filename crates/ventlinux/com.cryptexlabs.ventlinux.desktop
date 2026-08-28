@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=VentLinux
+GenericName=Voice Chat
+Comment=Ventrilo 3 voice client
+Exec=ventlinux
+Icon=audio-headset
+Terminal=false
+Categories=Network;AudioVideo;Chat;
+Keywords=Ventrilo;Voice;VoIP;Chat;PTT;Push-to-talk;
+StartupNotify=true
+# Must match .application_id() in crates/ventlinux/src/main.rs so the
+# compositor can tie the window to this entry (icon, window rules).
+StartupWMClass=com.cryptexlabs.ventlinux
