@@ -10,6 +10,13 @@ use vent_sys as v3;
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static CMD: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// libventrilo3 initialises every per-user volume to this (unity gain).
+const DEFAULT_USER_VOLUME: u8 = 79;
+
+/// Cap on how far a channel's parent chain is followed before we treat the
+/// server's channel data as malformed.
+const MAX_CHANNEL_DEPTH: usize = 64;
+
 fn cmd() -> &'static Mutex<()> {
     CMD.get_or_init(|| Mutex::new(()))
 }
@@ -106,7 +113,30 @@ impl Client {
     }
 
     pub fn channel_requires_password(id: u16) -> bool {
-        unsafe { v3::v3_channel_requires_password(id) != 0 }
+        // v3_channel_requires_password walks the parent chain and dereferences
+        // v3_get_channel() without a null check, so an id that is not in the
+        // channel list segfaults. Only ask about channels we can actually see.
+        // The walk is bounded because cyclic parent data would otherwise
+        // recurse forever inside the C function.
+        unsafe {
+            let mut next = id;
+            for _ in 0..MAX_CHANNEL_DEPTH {
+                if next == 0 {
+                    return v3::v3_channel_requires_password(id) != 0;
+                }
+                let c = v3::v3_get_channel(next);
+                if c.is_null() {
+                    return false;
+                }
+                let parent = (*c).parent;
+                v3::v3_free_channel(c);
+                if parent == next {
+                    return false;
+                }
+                next = parent;
+            }
+            false
+        }
     }
 
     pub fn codec_for_channel(id: u16) -> Option<Codec> {
@@ -215,10 +245,17 @@ impl Client {
         };
     }
     pub fn set_user_volume(user_id: u16, level: i32) {
+        // _v3_user_volumes is uint8_t[65535], so u16::MAX indexes one past it.
+        if user_id == u16::MAX {
+            return;
+        }
         let _g = cmd().lock().unwrap();
         unsafe { v3::v3_set_volume_user(user_id, level) };
     }
     pub fn user_volume(user_id: u16) -> u8 {
+        if user_id == u16::MAX {
+            return DEFAULT_USER_VOLUME;
+        }
         unsafe { v3::v3_get_volume_user(user_id) }
     }
 }
@@ -275,26 +312,29 @@ fn feeder(
     }
 
     let consumer_tx = tx.clone();
-    if let Err(e) = thread::Builder::new()
+    let consumer = match thread::Builder::new()
         .name("v3-consumer".into())
         .stack_size(1 << 21)
         .spawn(move || consumer(consumer_tx))
     {
-        let _ = tx.send(CoreEvent::ErrorMessage {
-            message: format!("could not start event thread: {e}"),
-            disconnected: true,
-        });
-        unsafe { v3::v3_logout() };
-        loop {
-            let msg = unsafe { v3::_v3_recv(v3::V3_BLOCK as i32) };
-            if msg.is_null() {
-                break;
+        Ok(handle) => handle,
+        Err(e) => {
+            let _ = tx.send(CoreEvent::ErrorMessage {
+                message: format!("could not start event thread: {e}"),
+                disconnected: true,
+            });
+            unsafe { v3::v3_logout() };
+            loop {
+                let msg = unsafe { v3::_v3_recv(v3::V3_BLOCK as i32) };
+                if msg.is_null() {
+                    break;
+                }
+                unsafe { v3::_v3_process_message(msg) };
             }
-            unsafe { v3::_v3_process_message(msg) };
+            RUNNING.store(false, Ordering::SeqCst);
+            return;
         }
-        RUNNING.store(false, Ordering::SeqCst);
-        return;
-    }
+    };
 
     loop {
         let msg = unsafe { v3::_v3_recv(v3::V3_BLOCK as i32) };
@@ -303,27 +343,39 @@ fn feeder(
         }
         unsafe { v3::_v3_process_message(msg) };
     }
+
+    // _v3_recv only returns NULL once the library has run _v3_logout(), which
+    // queues V3_EVENT_DISCONNECT, so the consumer is guaranteed to wake and
+    // exit. Wait for it: releasing the guard while it still touches
+    // libventrilo3's globals would let a new login race this teardown.
+    let _ = consumer.join();
+    RUNNING.store(false, Ordering::SeqCst);
 }
 
 fn consumer(tx: mpsc::Sender<CoreEvent>) {
+    let mut out = Vec::new();
     loop {
         let ev = unsafe { v3::v3_get_event(v3::V3_BLOCK as i32) };
         if ev.is_null() {
             break;
         }
-        let translated = unsafe { translate(ev) };
+        out.clear();
+        unsafe { translate(ev, &mut out) };
         unsafe { v3::v3_free_event(ev) };
-        if let Some(event) = translated {
-            let done = matches!(event, CoreEvent::Disconnected);
+        let mut done = false;
+        for event in out.drain(..) {
+            done |= matches!(event, CoreEvent::Disconnected);
             if tx.send(event).is_err() {
-                break;
-            }
-            if done {
-                break;
+                // Nobody is reading any more. Tear the session down so the
+                // feeder unblocks instead of holding the connection open.
+                unsafe { v3::v3_logout() };
+                return;
             }
         }
+        if done {
+            break;
+        }
     }
-    RUNNING.store(false, Ordering::SeqCst);
 }
 
 fn pcm_limits(len: usize, stereo: bool) -> (usize, usize) {
@@ -395,7 +447,22 @@ unsafe fn privchat_peer(ev: &v3::_v3_event) -> u16 {
     }
 }
 
-unsafe fn translate(ev: *mut v3::_v3_event) -> Option<CoreEvent> {
+/// One C event can produce more than one `CoreEvent`: the server reports our
+/// own channel move as an ordinary user move, and callers need both the roster
+/// update and the "you moved" signal.
+unsafe fn translate(ev: *mut v3::_v3_event, out: &mut Vec<CoreEvent>) {
+    let e = &*ev;
+    if let Some(event) = translate_one(ev) {
+        out.push(event);
+    }
+    if e.type_ as u32 == v3::_v3_events_V3_EVENT_USER_CHAN_MOVE
+        && e.user.id == v3::v3_get_user_id()
+    {
+        out.push(CoreEvent::MovedToChannel(e.channel.id));
+    }
+}
+
+unsafe fn translate_one(ev: *mut v3::_v3_event) -> Option<CoreEvent> {
     let e = &*ev;
     let ty = e.type_ as u32;
     match ty {
@@ -432,9 +499,9 @@ unsafe fn translate(ev: *mut v3::_v3_event) -> Option<CoreEvent> {
             read_user(e.user.id).map(CoreEvent::UserUpserted)
         }
         t if t == v3::_v3_events_V3_EVENT_USER_LOGOUT => Some(CoreEvent::UserRemoved(e.user.id)),
-        t if t == v3::_v3_events_V3_EVENT_CHANGE_CHANNEL => {
-            Some(CoreEvent::MovedToChannel(e.channel.id))
-        }
+        // V3_EVENT_CHANGE_CHANNEL is deliberately absent: it is an outbound
+        // request the library writes to its own pipe, never an inbound event.
+        // Our own moves arrive as V3_EVENT_USER_CHAN_MOVE (see translate).
         t if t == v3::_v3_events_V3_EVENT_USER_TALK_START => Some(CoreEvent::TalkStarted {
             user_id: e.user.id,
             rate: e.pcm.rate,

@@ -96,7 +96,15 @@ fn main() -> Result<()> {
         });
     }
 
-    let _ = ctrlc::set_handler(|| {
+    // v3_logout only does anything once we are logged in, so before that a
+    // graceful disconnect would silently swallow the signal and leave a hung
+    // connect unkillable. A second Ctrl+C always exits.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let sig = interrupted.clone();
+    let _ = ctrlc::set_handler(move || {
+        if !Client::is_logged_in() || sig.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
         println!("\ndisconnecting…");
         Client::disconnect();
     });

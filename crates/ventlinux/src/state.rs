@@ -52,6 +52,7 @@ pub struct Session {
     vox: VoxGate,
     vox_open: bool,
     want_disconnect: bool,
+    suppress_reconnect: bool,
     conn: Option<(String, u16, String, String)>,
     last_channel: u16,
     next_retry: Option<Instant>,
@@ -60,9 +61,13 @@ pub struct Session {
 impl Session {
     pub fn new() -> Self {
         let mut config = config::load_config();
-        // First builds defaulted to F13; most keyboards don't have it.
-        if config.ptt.code == 183 || config.ptt.display == "F13" {
-            config.ptt = vent_ptt::Binding::default();
+        // First builds defaulted to F13; most keyboards don't have it. Run this
+        // once only, so a user who deliberately picks F13 keeps it.
+        if !config.ptt_migrated {
+            if config.ptt.code == 183 || config.ptt.display == "F13" {
+                config.ptt = vent_ptt::Binding::default();
+            }
+            config.ptt_migrated = true;
             let _ = config::save_config(&config);
         }
         let mode = if config.transmit_mode == "vox" {
@@ -108,6 +113,7 @@ impl Session {
             vox,
             vox_open: false,
             want_disconnect: false,
+            suppress_reconnect: false,
             conn: None,
             last_channel: 0,
             next_retry: None,
@@ -208,10 +214,14 @@ impl Session {
         self.next_retry = None;
         self.stop_talk();
         self.stop_vox_capture();
-        if self.status == Status::Reconnecting {
+        // Always ask the library to drop the session. A retry may already have
+        // a login in flight, and leaving it running would bring the connection
+        // back moments after the user asked to leave.
+        Client::disconnect();
+        if self.events.is_none() {
+            // Nothing in flight (waiting between retries) — no stream end is
+            // coming to move us out of Reconnecting.
             self.status = Status::Disconnected;
-        } else {
-            Client::disconnect();
         }
     }
 
@@ -303,7 +313,10 @@ impl Session {
             }
             CoreEvent::LoginFailed(msg) => {
                 self.last_error = Some(msg);
-                self.status = Status::Connecting; // so stream-end does not retry
+                // On a first attempt the status is already Connecting, so
+                // on_stream_end gives up: bad host or credentials. During an
+                // automatic reconnect a refused login usually just means the
+                // server has not come back yet, so let the backoff keep going.
             }
             CoreEvent::ErrorMessage {
                 message,
@@ -311,10 +324,17 @@ impl Session {
             } => {
                 self.last_error = Some(message);
                 if disconnected {
-                    self.status = Status::Connecting;
+                    // The server dropped us deliberately (kick, ban, full).
+                    // Reconnecting would only hammer it.
+                    self.suppress_reconnect = true;
                 }
             }
             CoreEvent::LoginCompleted => {
+                if self.want_disconnect {
+                    // The user hit Disconnect while this login was in flight.
+                    Client::disconnect();
+                    return;
+                }
                 self.status = Status::Connected;
                 self.own_user_id = Client::own_user_id();
                 self.reconnect_attempt = 0;
@@ -367,7 +387,12 @@ impl Session {
         }
         Client::clear_audio_sink();
         self.ping = None;
-        if self.want_disconnect || self.conn.is_none() || self.status == Status::Connecting {
+        let suppressed = std::mem::take(&mut self.suppress_reconnect);
+        if suppressed
+            || self.want_disconnect
+            || self.conn.is_none()
+            || self.status == Status::Connecting
+        {
             self.status = Status::Disconnected;
             return;
         }
@@ -446,7 +471,12 @@ impl Session {
                     })
                     .unwrap_or(false);
                 if was_open && muted {
-                    Client::stop_transmit();
+                    if let Ok(mut tx) = VOX_TX.lock() {
+                        if tx.transmitting {
+                            Client::stop_transmit();
+                            tx.transmitting = false;
+                        }
+                    }
                     self.vox_open = false;
                     self.transmitting = false;
                 }
@@ -505,6 +535,10 @@ impl Session {
             gate.set_muted(self.mic_muted);
             *g = Some((gate, false));
         }
+        if let Ok(mut tx) = VOX_TX.lock() {
+            tx.enabled = true;
+            tx.transmitting = false;
+        }
         match Capture::start(nonempty(&self.config.input_device), {
             // Direct VOX path: start/stop transmit from the audio thread.
             move |pcm, rate| {
@@ -519,28 +553,26 @@ impl Session {
                 if let Ok(mut runtime) = VOX.lock() {
                     *runtime = None;
                 }
+                vox_tx_shutdown();
                 self.last_error = Some(format!("microphone: {e}"));
             }
         }
     }
 
     fn stop_vox_capture(&mut self) {
-        let runtime = VOX.lock().ok().and_then(|mut runtime| runtime.take());
-        let had_vox = runtime.is_some() || self.vox_open;
-        let was_open = runtime
-            .as_ref()
-            .map(|(_, open)| *open)
-            .unwrap_or(self.vox_open);
-        if had_vox {
+        let had_gate = VOX
+            .lock()
+            .ok()
+            .and_then(|mut runtime| runtime.take())
+            .is_some();
+        // Disarms the transmit side first, so an action the audio thread has
+        // already decided on cannot re-open transmit behind us.
+        vox_tx_shutdown();
+        if had_gate || self.vox_open {
             self.capture = None;
-        }
-        if was_open {
-            Client::stop_transmit();
-        }
-        self.vox_open = false;
-        if had_vox {
             self.transmitting = false;
         }
+        self.vox_open = false;
     }
 
     fn ptt_down(&mut self) {
@@ -618,24 +650,76 @@ use vent_core::VoxGate as StaticGate;
 
 static VOX: Mutex<Option<(StaticGate, bool)>> = Mutex::new(None);
 
+/// Transmit side of VOX, kept in its own lock so the audio thread never holds
+/// [`VOX`] — which the GTK loop reads every frame — across a blocking send.
+struct VoxTx {
+    /// False once capture is torn down, so a decision the audio thread already
+    /// took cannot re-open transmit afterwards.
+    enabled: bool,
+    transmitting: bool,
+}
+
+static VOX_TX: Mutex<VoxTx> = Mutex::new(VoxTx {
+    enabled: false,
+    transmitting: false,
+});
+
+/// Stop transmitting if VOX had it open. Caller must not hold [`VOX`].
+fn vox_tx_shutdown() {
+    if let Ok(mut tx) = VOX_TX.lock() {
+        tx.enabled = false;
+        if tx.transmitting {
+            Client::stop_transmit();
+            tx.transmitting = false;
+        }
+    }
+}
+
 fn vox_audio_thread(pcm: &[u8], rate: u32) {
-    let mut g = VOX.lock().unwrap();
-    let Some((gate, open)) = g.as_mut() else {
+    // Run the gate under its lock, then release it before touching the network:
+    // Client::send_pcm reaches into libventrilo3 and can block, and the GTK
+    // loop takes VOX every frame for the level meter.
+    let action = {
+        let Ok(mut g) = VOX.lock() else {
+            return;
+        };
+        let Some((gate, open)) = g.as_mut() else {
+            return;
+        };
+        let action = gate.process(pcm, rate);
+        match action {
+            VoxAction::Open(_) => *open = true,
+            VoxAction::Close => *open = false,
+            _ => {}
+        }
+        action
+    };
+
+    let Ok(mut tx) = VOX_TX.lock() else {
         return;
     };
-    match gate.process(pcm, rate) {
+    if !tx.enabled {
+        return;
+    }
+    match action {
         VoxAction::Idle => {}
         VoxAction::Open(chunks) => {
             Client::start_transmit();
-            *open = true;
+            tx.transmitting = true;
             for c in chunks {
                 Client::send_pcm(&c.pcm, c.rate, false);
             }
         }
-        VoxAction::Transmit(c) => Client::send_pcm(&c.pcm, c.rate, false),
+        VoxAction::Transmit(c) => {
+            if tx.transmitting {
+                Client::send_pcm(&c.pcm, c.rate, false);
+            }
+        }
         VoxAction::Close => {
-            Client::stop_transmit();
-            *open = false;
+            if tx.transmitting {
+                Client::stop_transmit();
+                tx.transmitting = false;
+            }
         }
     }
 }

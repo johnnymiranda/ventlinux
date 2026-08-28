@@ -8,6 +8,8 @@ use gtk::{
     SpinButton, Stack, ToggleButton, Window,
 };
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use vent_audio::AudioDevice;
@@ -29,7 +31,7 @@ struct ConnectView {
     status: Label,
 }
 
-pub fn build(app: &adw::Application, session: Rc<RefCell<Session>>) {
+pub fn build(app: &adw::Application, session: Rc<RefCell<Session>>) -> adw::ApplicationWindow {
     let window = adw::ApplicationWindow::new(app);
     window.set_title(Some("VentLinux"));
     window.set_default_size(480, 680);
@@ -79,6 +81,7 @@ pub fn build(app: &adw::Application, session: Rc<RefCell<Session>>) {
     let stack2 = stack.clone();
     let add2 = add_btn.clone();
     let cv_poll = connect_view.clone();
+    let built = window.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
         let dirty = sess.borrow_mut().poll();
         let st = sess.borrow().status;
@@ -89,6 +92,8 @@ pub fn build(app: &adw::Application, session: Rc<RefCell<Session>>) {
         maybe_password_prompt(&sess, &window);
         glib::ControlFlow::Continue
     });
+
+    built
 }
 
 fn maybe_password_prompt(session: &Rc<RefCell<Session>>, parent: &adw::ApplicationWindow) {
@@ -747,10 +752,22 @@ fn rebuild_main(page: &GtkBox, session: &Rc<RefCell<Session>>) {
     }
 }
 
+/// One rendered tree row, kept so we can compare against what is on screen.
+#[derive(Hash)]
+struct TreeRow {
+    depth: usize,
+    label: String,
+    highlight: bool,
+    /// `Some((id, password_protected))` for a channel, `None` for a user.
+    channel: Option<(u16, bool)>,
+}
+
+thread_local! {
+    /// (tree widget, signature of the rows it is showing).
+    static TREE_SIG: RefCell<Option<(usize, u64)>> = const { RefCell::new(None) };
+}
+
 fn fill_tree(list: &ListBox, session: &Rc<RefCell<Session>>) {
-    while let Some(c) = list.first_child() {
-        list.remove(&c);
-    }
     let s = session.borrow();
     let own_ch = s.own_channel_id;
     let own_id = s.own_user_id;
@@ -759,32 +776,18 @@ fn fill_tree(list: &ListBox, session: &Rc<RefCell<Session>>) {
     let rows = s.roster.flattened_tree();
     drop(s);
 
+    let mut entries = Vec::with_capacity(rows.len());
     for (depth, node) in rows {
-        let row = ListBoxRow::new();
-        let line = GtkBox::new(Orientation::Horizontal, 6);
-        line.set_margin_start(8 + 16 * depth as i32);
-        line.set_margin_top(4);
-        line.set_margin_bottom(4);
         match node {
             TreeNode::Channel(ch) => {
                 let lock = if ch.password_protected { "🔒 " } else { "" };
                 let here = if ch.id == own_ch { "  ← you" } else { "" };
-                let l = Label::new(Some(&format!("{lock}▸ {}{here}", ch.name)));
-                l.set_halign(Align::Start);
-                if ch.id == own_ch {
-                    l.add_css_class("heading");
-                }
-                line.append(&l);
-                let sess = session.clone();
-                let id = ch.id;
-                let pw = ch.password_protected;
-                let g = gtk::GestureClick::new();
-                g.connect_pressed(move |_, n, _, _| {
-                    if n == 2 {
-                        sess.borrow_mut().join(id, pw);
-                    }
+                entries.push(TreeRow {
+                    depth,
+                    label: format!("{lock}▸ {}{here}", ch.name),
+                    highlight: ch.id == own_ch,
+                    channel: Some((ch.id, ch.password_protected)),
                 });
-                row.add_controller(g);
             }
             TreeNode::User(u) => {
                 let me = u.id == own_id;
@@ -796,13 +799,62 @@ fn fill_tree(list: &ListBox, session: &Rc<RefCell<Session>>) {
                 } else {
                     format!("  ({})", u.comment)
                 };
-                let l = Label::new(Some(&format!("{mic}{}{you}{comment}", u.name)));
-                l.set_halign(Align::Start);
-                if is_talk {
-                    l.add_css_class("success");
-                }
-                line.append(&l);
+                entries.push(TreeRow {
+                    depth,
+                    label: format!("{mic}{}{you}{comment}", u.name),
+                    highlight: is_talk,
+                    channel: None,
+                });
             }
+        }
+    }
+
+    // Tearing the rows down and rebuilding them cancels any double-click in
+    // progress and scrolls the list back to the top, so only do it when the
+    // rendered content actually changed — a ping alone must not disturb it.
+    let mut hasher = DefaultHasher::new();
+    entries.hash(&mut hasher);
+    let signature = (list.as_ptr() as usize, hasher.finish());
+    let unchanged = TREE_SIG.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let same = *cell == Some(signature);
+        if !same {
+            *cell = Some(signature);
+        }
+        same
+    });
+    if unchanged {
+        return;
+    }
+
+    while let Some(c) = list.first_child() {
+        list.remove(&c);
+    }
+    for entry in entries {
+        let row = ListBoxRow::new();
+        let line = GtkBox::new(Orientation::Horizontal, 6);
+        line.set_margin_start(8 + 16 * entry.depth as i32);
+        line.set_margin_top(4);
+        line.set_margin_bottom(4);
+        let l = Label::new(Some(&entry.label));
+        l.set_halign(Align::Start);
+        if entry.highlight {
+            l.add_css_class(if entry.channel.is_some() {
+                "heading"
+            } else {
+                "success"
+            });
+        }
+        line.append(&l);
+        if let Some((id, pw)) = entry.channel {
+            let sess = session.clone();
+            let g = gtk::GestureClick::new();
+            g.connect_pressed(move |_, n, _, _| {
+                if n == 2 {
+                    sess.borrow_mut().join(id, pw);
+                }
+            });
+            row.add_controller(g);
         }
         row.set_child(Some(&line));
         list.append(&row);

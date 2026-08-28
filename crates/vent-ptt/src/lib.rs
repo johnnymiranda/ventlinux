@@ -4,6 +4,7 @@
 
 use evdev::{Device, EventType, KeyCode};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -110,45 +111,51 @@ fn watch_loop(
     ev_tx: mpsc::Sender<PttEvent>,
     bind_tx: mpsc::Sender<Binding>,
 ) {
-    let mut devices = open_devices();
+    let mut devices = Vec::new();
+    open_new_devices(&mut devices);
     let mut last_rescan = std::time::Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         if last_rescan.elapsed() > Duration::from_secs(3) {
-            devices = open_devices();
+            // Only pick up devices that appeared since the last scan. Reopening
+            // the ones we already hold would discard whatever they had queued —
+            // losing a PTT release that way leaves the microphone stuck open.
+            open_new_devices(&mut devices);
             last_rescan = std::time::Instant::now();
         }
         let mut any = false;
-        for dev in &mut devices {
-            match dev.fetch_events() {
-                Ok(iter) => {
-                    for ev in iter {
-                        any = true;
-                        handle(ev, &binding, &capturing, &ev_tx, &bind_tx);
-                    }
+        devices.retain_mut(|(_, dev)| match dev.fetch_events() {
+            Ok(iter) => {
+                for ev in iter {
+                    any = true;
+                    handle(ev, &binding, &capturing, &ev_tx, &bind_tx);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => {}
+                true
             }
-        }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+            // The device went away (unplugged); the next rescan re-adds it if
+            // it comes back.
+            Err(_) => false,
+        });
         if !any {
             thread::sleep(Duration::from_millis(5));
         }
     }
 }
 
-fn open_devices() -> Vec<Device> {
-    let mut out = Vec::new();
-    for (_, d) in evdev::enumerate() {
+fn open_new_devices(devices: &mut Vec<(PathBuf, Device)>) {
+    for (path, d) in evdev::enumerate() {
+        if devices.iter().any(|(known, _)| *known == path) {
+            continue;
+        }
         // A blocking descriptor would stall the watcher on the first idle
         // device and prevent PTT events from every other keyboard or mouse.
         if d.set_nonblocking(true).is_ok() {
-            out.push(d);
+            devices.push((path, d));
         }
     }
-    out
 }
 
 fn handle(
@@ -169,9 +176,21 @@ fn handle(
     let down = value == 1;
 
     if capturing.load(Ordering::SeqCst) && down {
+        // Left click is how the user arms capture and dismisses the dialog, so
+        // binding it here would silently make every click transmit.
+        if code == KeyCode::BTN_LEFT.0 {
+            return;
+        }
+        if code == KeyCode::KEY_ESC.0 {
+            capturing.store(false, Ordering::SeqCst);
+            return;
+        }
         let new = binding_from_code(code);
         *binding.lock().unwrap() = new.clone();
         capturing.store(false, Ordering::SeqCst);
+        // The old binding may still be physically held; its release would no
+        // longer match, so close any transmission it opened.
+        let _ = ev_tx.send(PttEvent::Up);
         let _ = bind_tx.send(new);
         return;
     }
