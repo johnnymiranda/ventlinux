@@ -14,7 +14,7 @@
 
 _pkgname=ventlinux
 pkgname=ventlinux-git
-pkgver=r6.c7e563c
+pkgver=r8.ed265a9
 pkgrel=1
 pkgdesc="Native Linux client for Ventrilo 3 voice servers, with global push-to-talk"
 arch=('x86_64')

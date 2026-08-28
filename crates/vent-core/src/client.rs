@@ -455,8 +455,7 @@ unsafe fn translate(ev: *mut v3::_v3_event, out: &mut Vec<CoreEvent>) {
     if let Some(event) = translate_one(ev) {
         out.push(event);
     }
-    if e.type_ as u32 == v3::_v3_events_V3_EVENT_USER_CHAN_MOVE
-        && e.user.id == v3::v3_get_user_id()
+    if e.type_ as u32 == v3::_v3_events_V3_EVENT_USER_CHAN_MOVE && e.user.id == v3::v3_get_user_id()
     {
         out.push(CoreEvent::MovedToChannel(e.channel.id));
     }
